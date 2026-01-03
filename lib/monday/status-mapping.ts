@@ -1,0 +1,47 @@
+// src/lib/monday/status-mapping.ts
+
+export const MONDAY_COLUMN_IDS = {
+  // ✅ IDs taken directly from your JSON dump
+  STATUS: "color_mkyqy4tv",      
+  CARRIER: "dropdown_mkyshnb8",   
+  POLICY_ID: "text_mkys4x46",     
+  PHONE: "phone_mkys20n9"         
+} as const
+
+export const SUPABASE_TO_MONDAY_STATUS: Record<string, string> = {
+  // Internal DB Status : Monday Label (MUST EXIST ON BOARD)
+  
+  // 1. You must create these labels on Monday for these to work:
+  open: "Open",
+  in_progress: "Working on it",
+  escalated: "Stuck",
+  dead: "Done", 
+
+  // 2. These already exist on your board:
+  pending_lapse: "Pending Lapse",
+  charged_back: "Charged Back",
+  issued_not_paid: "Issued Not Paid",
+  issued_paid: "Sold",
+  resolved: "Sold",
+}
+
+export const MONDAY_TO_SUPABASE_STATUS: Record<string, string> = {
+  "Pending Lapse": "pending_lapse",
+  "Charged Back": "charged_back",
+  "Issued Not Paid": "issued_not_paid",
+  "Sold": "issued_paid",
+  "Open": "open",
+  "Working on it": "in_progress",
+  "Stuck": "escalated",
+  "Done": "dead"
+}
+
+export const TARGET_WEBHOOK_STATUSES = ["Pending Lapse", "Charged Back", "Issued Not Paid", "Sold"]
+
+export function mapSupabaseToMonday(supabaseStatus: string): string | null {
+  return SUPABASE_TO_MONDAY_STATUS[supabaseStatus] || null
+}
+
+export function mapMondayToSupabase(mondayStatus: string): string {
+  return MONDAY_TO_SUPABASE_STATUS[mondayStatus] || "open"
+}

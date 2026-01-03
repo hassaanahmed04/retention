@@ -1,0 +1,108 @@
+import os
+import re
+
+# ===================== EMOJI / UNICODE PATTERNS =====================
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\U0001FB00-\U0001FBFF"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "\u2300-\u23FF"
+    "\u2B00-\u2BFF"
+    "\u200D\u200C\u2060"
+    "\uFE0E\uFE0F"
+    "\uE0020-\uE007F"
+    "]+",
+    flags=re.UNICODE
+)
+
+# ===================== COMMENT PATTERNS =====================
+# Python
+PY_SINGLE_COMMENT = re.compile(r"#.*")
+PY_DOCSTRING = re.compile(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\')')
+
+# JS / TS / C / C++
+C_SINGLE_COMMENT = re.compile(r"//.*")
+C_BLOCK_COMMENT = re.compile(r"/\*[\s\S]*?\*/")
+
+# ===================== IGNORE RULES =====================
+IGNORE_DIRS = {".git", "__pycache__", "node_modules", "venv", "env",
+               ".idea", ".vscode", "build", "dist"}
+
+IGNORE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+                     ".exe", ".dll", ".so", ".zip", ".pdf",
+                     ".woff", ".woff2"}
+
+SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h"}
+
+# ===================== CLEANERS =====================
+def strip_emojis(text: str) -> str:
+    return EMOJI_PATTERN.sub("", text)
+
+def remove_python_comments(text: str) -> str:
+    text = PY_DOCSTRING.sub("", text)
+    text = PY_SINGLE_COMMENT.sub("", text)
+    return text
+
+def remove_c_style_comments(text: str) -> str:
+    text = C_BLOCK_COMMENT.sub("", text)
+    text = C_SINGLE_COMMENT.sub("", text)
+    return text
+
+def clean_code(text: str, ext: str) -> str:
+    text = strip_emojis(text)
+    if ext == ".py":
+        text = remove_python_comments(text)
+    else:
+        text = remove_c_style_comments(text)
+    return text
+
+# ===================== FILE PROCESSING =====================
+def process_file(file_path: str, backup=True) -> bool:
+    """Returns True if the file was updated, else False"""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        return False
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            original = f.read()
+
+        cleaned = clean_code(original, ext)
+
+        if cleaned != original:
+            if backup:
+                with open(file_path + ".bak", "w", encoding="utf-8") as b:
+                    b.write(original)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(cleaned)
+
+            print(f"Updated: {file_path}")
+            return True
+
+    except (UnicodeDecodeError, PermissionError):
+        pass
+
+    return False
+
+def process_path(path: str):
+    if os.path.isfile(path):
+        process_file(path)
+        return
+
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in IGNORE_EXTENSIONS:
+                continue
+            process_file(os.path.join(root, file))
+
+# ===================== ENTRY POINT =====================
+if __name__ == "__main__":
+    TARGET_PATHS = ["app", "components", "lib", "scripts", "."]
+    for path in TARGET_PATHS:
+        if os.path.exists(path):
+            process_path(path)
+    print("Processing completed.")

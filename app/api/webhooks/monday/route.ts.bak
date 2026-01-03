@@ -1,0 +1,239 @@
+import { type NextRequest, NextResponse } from "next/server"
+import { createClient } from "@supabase/supabase-js"
+import { mondayQuery } from "@/lib/monday/client"
+import { mapMondayToSupabase, TARGET_WEBHOOK_STATUSES, MONDAY_COLUMN_IDS } from "@/lib/monday/status-mapping"
+
+// Direct client for debugging (Server-side only)
+const supabaseAdmin = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false,
+  },
+})
+
+export async function POST(req: NextRequest) {
+  try {
+    console.log("---  WEBHOOK RECEIVED ---")
+
+    const body = await req.json()
+
+    // 1. Handle Challenge (Monday verification)
+    if (body.challenge) {
+      console.log(" Challenge accepted")
+      return NextResponse.json({ challenge: body.challenge })
+    }
+
+    const { event } = body
+    if (!event) {
+      return NextResponse.json({ error: "No event" }, { status: 400 })
+    }
+
+    if (event.type !== "update_column_value") {
+      return NextResponse.json({ message: "Ignored event type" })
+    }
+
+    // 2. Check Status Label
+    let statusLabel = "UNKNOWN"
+
+    if (event.value?.label?.text) {
+      statusLabel = event.value.label.text
+    } else if (event.value?.label_text) {
+      statusLabel = event.value.label_text
+    } else if (typeof event.value?.label === "string") {
+      statusLabel = event.value.label
+    }
+
+    console.log(` Monday Status Label: "${statusLabel}"`)
+
+    if (!TARGET_WEBHOOK_STATUSES.includes(statusLabel)) {
+      console.log(` Status "${statusLabel}" is not a target status. Skipping.`)
+      return NextResponse.json({ message: "Status not targeted" })
+    }
+
+    console.log(`Processing Item ID: ${event.pulseId}`)
+
+    // 3. Fetch Item Details from Monday
+    const itemQuery = `
+      query {
+        items (ids: [${event.pulseId}]) {
+          name
+          column_values {
+            id
+            text
+            value
+            type
+          }
+        }
+      }
+    `
+    const mondayRes = await mondayQuery<any>({ query: itemQuery })
+
+    if (mondayRes.errors) {
+      console.error(" Monday API Error:", mondayRes.errors)
+      throw new Error("Failed to fetch item details")
+    }
+
+    const item = mondayRes.data?.items?.[0]
+    if (!item) {
+      return NextResponse.json({ error: "Item not found" }, { status: 404 })
+    }
+
+    const clientName = item.name
+    console.log(` Client Name: ${clientName}`)
+
+    // 4. Extract Data (Phone, Carrier, Policy ID)
+    let clientPhone = null
+    let carrier = "Unknown"
+    let policyId = "Unknown"
+
+    item.column_values.forEach((col: any) => {
+      // A. Phone Extraction
+      if (col.type === "phone" || col.id.toLowerCase().includes("phone")) {
+        if (col.value) {
+          try {
+            const p = JSON.parse(col.value)
+            clientPhone = p.phone
+          } catch {
+            clientPhone = col.text
+          }
+        } else {
+          clientPhone = col.text
+        }
+      }
+
+      // B. Carrier Extraction
+      if (col.id === MONDAY_COLUMN_IDS.CARRIER) {
+        carrier = col.text || "Unknown"
+      }
+
+      // C. Policy ID Extraction
+      if (col.id === MONDAY_COLUMN_IDS.POLICY_ID) {
+        policyId = col.text && col.text.trim() ? col.text.trim() : "Unknown"
+      }
+    })
+
+    console.log(` Extracted -> Phone: ${clientPhone} | Carrier: ${carrier} | Policy: ${policyId}`)
+
+    // Clean phone for DB matching
+    const normalizedPhone = clientPhone ? clientPhone.replace(/\D/g, "") : null
+
+    // 5. Smart Unification Logic
+    console.log(` Checking DB for phone: ${normalizedPhone}`)
+
+    // Prepare the Specific Item Object (The "Atom" of our data)
+    const newItemObj = {
+      id: String(event.pulseId),
+      policy: policyId,
+      carrier: carrier,
+      status: mapMondayToSupabase(statusLabel), // Status of THIS specific item
+      monday_label: statusLabel,
+      updated_at: new Date().toISOString()
+    }
+
+    let existingCase = null
+    if (normalizedPhone) {
+      const { data, error } = await supabaseAdmin
+        .from("retention_cases")
+        .select("*")
+        .eq("normalized_phone", normalizedPhone)
+        .maybeSingle()
+
+      if (error) console.error(" DB Search Error:", error)
+      existingCase = data
+    }
+
+    // A. UPDATE EXISTING CASE
+    if (existingCase) {
+      console.log(` Merging into Case: ${existingCase.id}`)
+
+      // 1. Get current linked items (or empty array)
+      let currentItems: any[] = Array.isArray(existingCase.linked_items) 
+        ? existingCase.linked_items 
+        : []
+
+      // 2. Check if this Monday Item is already tracked
+      const index = currentItems.findIndex((i: any) => i.id === newItemObj.id)
+
+      if (index >= 0) {
+        // Update the existing item
+        currentItems[index] = newItemObj
+      } else {
+        // Add as a new item
+        currentItems.push(newItemObj)
+      }
+
+      // 3. Determine Overall Case Status
+      // Logic: If ANY item is a "Problem", the whole case is a "Problem".
+      // If ALL items are "Done", the case is "Resolved".
+      const allStatuses = currentItems.map(i => i.status)
+      let overallStatus = "open"
+
+      const isResolved = (s: string) => ["issued_paid", "resolved", "dead"].includes(s)
+      const isProblem = (s: string) => ["pending_lapse", "charged_back", "issued_not_paid"].includes(s)
+      const isInProgress = (s: string) => s === "in_progress"
+
+      if (allStatuses.every(isResolved)) {
+        overallStatus = "resolved"
+      } else if (allStatuses.some(isProblem)) {
+        // Find the first problem status to set as the main status
+        overallStatus = allStatuses.find(isProblem) || "pending_lapse"
+      } else if (allStatuses.some(isInProgress)) {
+        overallStatus = "in_progress"
+      }
+
+      // 4. Update Database
+      const { error: updateError } = await supabaseAdmin
+        .from("retention_cases")
+        .update({
+          linked_items: currentItems, // <--- Save structured data
+          status: overallStatus,      // <--- Update calculated status
+          client_name: clientName,    // Keep name fresh
+          updated_at: new Date().toISOString(),
+          
+          // Keep these arrays for legacy support/easier searching
+          monday_item_ids: currentItems.map(i => i.id),
+          policy_ids: currentItems.map(i => i.policy).filter(p => p !== "Unknown"),
+          carrier: carrier !== "Unknown" ? carrier : existingCase.carrier
+        })
+        .eq("id", existingCase.id)
+
+      if (updateError) {
+        console.error(" Update Failed:", updateError)
+        return NextResponse.json({ error: updateError.message }, { status: 500 })
+      }
+      console.log(" Update & Merge Success")
+
+    } 
+    // B. CREATE NEW CASE
+    else {
+      console.log(`🆕 Creating NEW Unified Case`)
+
+      const { error: insertError } = await supabaseAdmin.from("retention_cases").insert({
+        client_name: clientName,
+        client_phone: clientPhone || "Unknown",
+        carrier: carrier,
+        
+        // Initial Status
+        status: newItemObj.status,
+        fix_type: statusLabel.toLowerCase().replace(/ /g, "_"),
+        priority: "urgent",
+        
+        // Structure Data
+        linked_items: [newItemObj], // <--- Start the array
+        monday_item_ids: [newItemObj.id],
+        policy_ids: policyId !== "Unknown" ? [policyId] : []
+      })
+
+      if (insertError) {
+        console.error(" Insert Failed:", insertError)
+        return NextResponse.json({ error: insertError.message }, { status: 500 })
+      }
+      console.log(" Insert Success")
+    }
+
+    return NextResponse.json({ success: true, mapped_status: newItemObj.status })
+  } catch (error: any) {
+    console.error(" CRITICAL SERVER ERROR:", error)
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
